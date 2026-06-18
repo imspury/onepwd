@@ -23,6 +23,7 @@ class FakeRun:
     responses: list[subprocess.CompletedProcess] = field(default_factory=list)
     calls: list[list[str]] = field(default_factory=list)
     raises: BaseException | None = None
+    last_input: str | None = None
 
     def set_response(
         self, *, stdout: str = "", stderr: str = "", returncode: int = 0
@@ -39,6 +40,7 @@ class FakeRun:
 
     def __call__(self, cmd: list[str], *args: Any, **kwargs: Any) -> Any:
         self.calls.append(list(cmd))
+        self.last_input = kwargs.get("input")
         if self.raises is not None:
             raise self.raises
         if not self.responses:

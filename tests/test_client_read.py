@@ -34,7 +34,9 @@ def test_get_item(client: OnePasswordClient, fake_run: FakeRun) -> None:
     assert "--vault=Work" in fake_run.last_call
 
 
-def test_get_field_strips_whitespace(client: OnePasswordClient, fake_run: FakeRun) -> None:
+def test_get_field_strips_whitespace_and_reveals(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
     fake_run.set_response(stdout="hunter2\n")
     value = client.get_field("GitHub", "password")
     assert value == "hunter2"
@@ -45,22 +47,66 @@ def test_get_field_strips_whitespace(client: OnePasswordClient, fake_run: FakeRu
         "GitHub",
         "--fields=password",
     ]
+    assert "--reveal" in fake_run.last_call
 
 
-def test_get_multiple_fields_aggregates(client: OnePasswordClient, fake_run: FakeRun) -> None:
-    fake_run.set_response(stdout="alice\n")
-    fake_run.set_response(stdout="hunter2\n")
-    result = client.get_multiple_fields("GitHub", ["username", "password"])
-    assert result == {"username": "alice", "password": "hunter2"}
-
-
-def test_get_multiple_fields_returns_none_on_failure(
+def test_get_multiple_fields_single_call(
     client: OnePasswordClient, fake_run: FakeRun
 ) -> None:
-    fake_run.set_response(stdout="alice\n")
-    fake_run.set_response(returncode=1, stderr="no such field")
+    fake_run.set_response(
+        stdout=json.dumps(
+            [
+                {"id": "username", "label": "username", "value": "alice"},
+                {"id": "password", "label": "password", "value": "hunter2"},
+            ]
+        )
+    )
+    result = client.get_multiple_fields("GitHub", ["username", "password"])
+    assert result == {"username": "alice", "password": "hunter2"}
+    assert len(fake_run.op_calls) == 1
+    assert "--fields=username,password" in fake_run.last_call
+    assert "--reveal" in fake_run.last_call
+    assert "--format=json" in fake_run.last_call
+
+
+def test_get_multiple_fields_handles_dict_payload(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
+    fake_run.set_response(
+        stdout=json.dumps({"id": "username", "label": "username", "value": "alice"})
+    )
+    result = client.get_multiple_fields("GitHub", ["username"])
+    assert result == {"username": "alice"}
+
+
+def test_get_multiple_fields_missing_field_is_none(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
+    fake_run.set_response(
+        stdout=json.dumps(
+            [{"id": "username", "label": "username", "value": "alice"}]
+        )
+    )
     result = client.get_multiple_fields("GitHub", ["username", "missing"])
     assert result == {"username": "alice", "missing": None}
+
+
+def test_get_multiple_fields_failure_falls_back_per_field(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
+    # Batched call rejects on unknown field; per-field fallback recovers the rest.
+    fake_run.set_response(returncode=1, stderr="'b' isn't a field")
+    fake_run.set_response(stdout="alice\n")  # get_field("a") succeeds
+    fake_run.set_response(returncode=1, stderr="not a field")  # get_field("b") fails
+    result = client.get_multiple_fields("Item", ["a", "b"])
+    assert result == {"a": "alice", "b": None}
+
+
+def test_get_multiple_fields_empty_skips_call(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
+    assert client.get_multiple_fields("GitHub", []) == {}
+    assert fake_run.op_calls == []
 
 
 def test_non_zero_exit_raises(client: OnePasswordClient, fake_run: FakeRun) -> None:

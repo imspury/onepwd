@@ -68,9 +68,17 @@ def test_create_passes_assignments(
     )
     assert rc == 0
     last = fake_run.last_call
-    assert "username=alice" in last
-    assert "password=hunter2" in last
-    assert "--category=login" in last
+    # Category and secrets ride on stdin, not argv.
+    assert "--category=login" not in last
+    assert "--template=-" not in last
+    assert "password=hunter2" not in last
+    template = json.loads(fake_run.last_input)
+    assert template["category"] == "LOGIN"
+    by_label = {f["label"]: f for f in template["fields"]}
+    assert by_label["username"]["value"] == "alice"
+    assert by_label["username"]["purpose"] == "USERNAME"
+    assert by_label["password"]["value"] == "hunter2"
+    assert by_label["password"]["purpose"] == "PASSWORD"
 
 
 def test_error_exits_nonzero(

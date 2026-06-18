@@ -29,14 +29,22 @@ def test_init_raises_when_op_not_installed(fake_run: FakeRun) -> None:
 
 def test_init_raises_when_not_signed_in(fake_run: FakeRun) -> None:
     fake_run.set_response(stdout="2.29.0\n")
-    fake_run.set_response(returncode=1, stderr="not signed in")
+    fake_run.set_response(returncode=1, stderr="You are not currently signed in.")
     with pytest.raises(OnePasswordError, match="Not signed in"):
         OnePasswordClient(auto_signin=False)
 
 
+def test_init_distinguishes_other_whoami_failures(fake_run: FakeRun) -> None:
+    fake_run.set_response(stdout="2.29.0\n")
+    fake_run.set_response(returncode=1, stderr="connection refused")
+    with pytest.raises(OnePasswordError, match="whoami") as exc:
+        OnePasswordClient(auto_signin=False)
+    assert "Not signed in" not in str(exc.value)
+
+
 def test_init_auto_signin_invokes_op_signin(fake_run: FakeRun) -> None:
     fake_run.set_response(stdout="2.29.0\n")
-    fake_run.set_response(returncode=1, stderr="not signed in")
+    fake_run.set_response(returncode=1, stderr="You are not currently signed in.")
     fake_run.set_response()  # `op signin` succeeds
     OnePasswordClient(auto_signin=True)
     signin_call = fake_run.calls[-1]
@@ -45,7 +53,7 @@ def test_init_auto_signin_invokes_op_signin(fake_run: FakeRun) -> None:
 
 def test_auto_signin_propagates_failure(fake_run: FakeRun) -> None:
     fake_run.set_response(stdout="2.29.0\n")
-    fake_run.set_response(returncode=1, stderr="not signed in")
+    fake_run.set_response(returncode=1, stderr="You are not currently signed in.")
     fake_run.set_response(returncode=1, stderr="signin error")
     with pytest.raises(OnePasswordError, match="Failed to sign in"):
         OnePasswordClient(auto_signin=True)
