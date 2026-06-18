@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from types import TracebackType
@@ -11,6 +12,34 @@ from onepwd._process import _run_op
 from onepwd.exceptions import OnePasswordError
 
 logger = logging.getLogger(__name__)
+
+_NOT_SIGNED_IN_MARKERS = (
+    "not currently signed in",
+    "not signed in",
+    "session expired",
+    "no account",
+)
+
+_CONCEALED_LABEL_HINTS = (
+    "password",
+    "secret",
+    "token",
+    "api_key",
+    "api key",
+    "apikey",
+    "credential",
+    "private",
+    "passphrase",
+)
+
+# `purpose` links a field to a category's built-in slot (vs. adding a custom
+# field with the same label). Set for the three labels op recognises.
+_PURPOSE_BY_LABEL = {
+    "username": "USERNAME",
+    "password": "PASSWORD",
+    "notesplain": "NOTES",
+    "notes": "NOTES",
+}
 
 
 class OnePasswordClient:
@@ -54,19 +83,23 @@ class OnePasswordClient:
         except subprocess.CalledProcessError as e:
             raise OnePasswordError(f"1Password CLI failed to run: {e}") from e
 
-        try:
-            result = subprocess.run(
-                ["op", "whoami"], capture_output=True, text=True, check=True
-            )
-        except subprocess.CalledProcessError:
-            if auto_signin:
-                logger.info("Not signed in to 1Password CLI; attempting signin...")
-                self._perform_signin()
-                return
+        result = subprocess.run(
+            ["op", "whoami"], capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").lower()
+            if any(marker in stderr for marker in _NOT_SIGNED_IN_MARKERS):
+                if auto_signin:
+                    logger.info("Not signed in to 1Password CLI; attempting signin...")
+                    self._perform_signin()
+                    return
+                raise OnePasswordError(
+                    "Not signed in to 1Password CLI. Run `op signin` first, or "
+                    "construct OnePasswordClient(auto_signin=True)."
+                )
             raise OnePasswordError(
-                "Not signed in to 1Password CLI. Run `op signin` first, or "
-                "construct OnePasswordClient(auto_signin=True)."
-            ) from None
+                f"`op whoami` failed: {(result.stderr or '').strip() or 'unknown error'}"
+            )
 
         email = _extract_field(result.stdout, "Email:")
         user_id = _extract_field(result.stdout, "User ID:")
@@ -111,8 +144,19 @@ class OnePasswordClient:
         field_name: str,
         vault: str | None = None,
     ) -> str:
-        """Return a single field value as a string (whitespace-stripped)."""
-        args = ["item", "get", item_name, f"--fields={field_name}"]
+        """Return a single field value as a string (whitespace-stripped).
+
+        Concealed fields (passwords, tokens) are revealed — without ``--reveal``
+        ``op`` returns ``[concealed]``, which is never what a programmatic
+        caller wants.
+        """
+        args = [
+            "item",
+            "get",
+            item_name,
+            f"--fields={field_name}",
+            "--reveal",
+        ]
         if vault:
             args.append(f"--vault={vault}")
         return _run_op(args, parse_json=False).strip()
@@ -125,16 +169,55 @@ class OnePasswordClient:
     ) -> dict[str, str | None]:
         """Return a dict of field name → value.
 
-        Fields that fail to load are returned as ``None`` so callers can decide
-        whether to fail or fall back.
+        Issues a single ``op item get`` call and maps the returned field array
+        back to the requested names. If ``op`` rejects the batch because *any*
+        of the names is unknown, falls back to per-field reads so the caller
+        still gets values for the names that do exist (missing ones come back
+        as ``None``).
         """
+        if not field_names:
+            return {}
+
+        args = [
+            "item",
+            "get",
+            item_name,
+            f"--fields={','.join(field_names)}",
+            "--reveal",
+            "--format=json",
+        ]
+        if vault:
+            args.append(f"--vault={vault}")
+
+        try:
+            payload = _run_op(args)
+        except OnePasswordError as e:
+            logger.info(
+                "Batched fields read failed for '%s' (%s); falling back to per-field.",
+                item_name,
+                e,
+            )
+            return self._get_fields_individually(item_name, field_names, vault)
+
+        # Single-field requests come back as a dict; multi-field as a list.
+        entries = [payload] if isinstance(payload, dict) else list(payload)
+        by_label = {entry.get("label"): entry.get("value") for entry in entries}
+        by_id = {entry.get("id"): entry.get("value") for entry in entries}
+        return {name: by_label.get(name, by_id.get(name)) for name in field_names}
+
+    def _get_fields_individually(
+        self,
+        item_name: str,
+        field_names: list[str],
+        vault: str | None,
+    ) -> dict[str, str | None]:
         result: dict[str, str | None] = {}
-        for field_name in field_names:
+        for name in field_names:
             try:
-                result[field_name] = self.get_field(item_name, field_name, vault)
+                result[name] = self.get_field(item_name, name, vault=vault)
             except OnePasswordError as e:
-                logger.warning("Could not retrieve field '%s': %s", field_name, e)
-                result[field_name] = None
+                logger.warning("Could not retrieve field '%s': %s", name, e)
+                result[name] = None
         return result
 
     def create_item(
@@ -147,24 +230,29 @@ class OnePasswordClient:
     ) -> dict[str, Any]:
         """Create a new item.
 
-        ``fields`` are passed to ``op item create`` as assignment statements
-        (``label=value``). Note: values appear on the command line and may be
-        visible to other processes via ``ps`` for the duration of the call.
+        Field values are sent to ``op`` via stdin as a JSON template, so they
+        never appear on the process command line (no ``ps`` exposure). Field
+        labels containing common credential keywords (``password``, ``token``,
+        ``secret``, …) are marked CONCEALED; everything else is STRING.
         """
-        args = [
-            "item",
-            "create",
-            f"--category={category}",
-            f"--title={title}",
-            "--format=json",
-        ]
+        args = ["item", "create", "--format=json"]
         if vault:
             args.append(f"--vault={vault}")
         if tags:
             args.append(f"--tags={','.join(tags)}")
-        if fields:
-            args.extend(f"{k}={v}" for k, v in fields.items())
-        return _run_op(args)
+
+        if not fields:
+            args.extend([f"--category={category}", f"--title={title}"])
+            return _run_op(args)
+
+        # When stdin carries a template, `op` rejects --category/--title on
+        # argv as a conflict — title and category live in the template.
+        template = {
+            "title": title,
+            "category": category.upper(),
+            "fields": [_field_template(label, value) for label, value in fields.items()],
+        }
+        return _run_op(args, input=json.dumps(template))
 
     def update_item(
         self,
@@ -174,7 +262,10 @@ class OnePasswordClient:
     ) -> dict[str, Any]:
         """Edit fields on an existing item.
 
-        Same ``ps``-visibility caveat as :meth:`create_item`.
+        ``op item edit`` has no stdin template, so values are passed as
+        ``label=value`` argv entries — they may be visible to other processes
+        via ``ps`` for the duration of the call. Avoid for highly sensitive
+        values on shared hosts.
         """
         args = ["item", "edit", item_name, "--format=json"]
         if vault:
@@ -197,8 +288,32 @@ class OnePasswordClient:
         _run_op(args, parse_json=False)
 
 
+def _field_template(label: str, value: str) -> dict[str, Any]:
+    """Build one entry of the JSON template's ``fields`` array.
+
+    Labels recognised by `op` (``username``, ``password``, ``notes``) get a
+    ``purpose`` so they map to the category's built-in slot — without it, op
+    creates a *custom* field of the same name alongside the built-in one,
+    leaving you with two ``password`` fields per item.
+    """
+    lowered = label.lower()
+    field: dict[str, Any] = {"id": label, "label": label, "value": value}
+    purpose = _PURPOSE_BY_LABEL.get(lowered)
+    if purpose:
+        field["purpose"] = purpose
+        # Built-in PASSWORD/USERNAME/NOTES already carry the right type;
+        # `op` errors if you pass an explicit type alongside `purpose`.
+        return field
+    field["type"] = (
+        "CONCEALED"
+        if any(hint in lowered for hint in _CONCEALED_LABEL_HINTS)
+        else "STRING"
+    )
+    return field
+
+
 def _extract_field(text: str, label: str) -> str:
     for line in text.splitlines():
-        if label in line:
+        if line.startswith(label):
             return line.split(":", 1)[1].strip()
     return "unknown"
