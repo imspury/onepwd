@@ -50,6 +50,23 @@ def test_get_field_strips_whitespace_and_reveals(
     assert "--reveal" in fake_run.last_call
 
 
+def test_get_field_preserves_internal_whitespace(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
+    # op appends a trailing newline; only that is stripped. Whitespace that is
+    # part of the secret itself must survive.
+    fake_run.set_response(stdout="  pa ss \n")
+    value = client.get_field("GitHub", "password")
+    assert value == "  pa ss "
+
+
+def test_get_field_strips_only_trailing_newline(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
+    fake_run.set_response(stdout="secret\r\n")
+    assert client.get_field("GitHub", "token") == "secret"
+
+
 def test_get_multiple_fields_single_call(
     client: OnePasswordClient, fake_run: FakeRun
 ) -> None:
@@ -100,6 +117,19 @@ def test_get_multiple_fields_failure_falls_back_per_field(
     fake_run.set_response(returncode=1, stderr="not a field")  # get_field("b") fails
     result = client.get_multiple_fields("Item", ["a", "b"])
     assert result == {"a": "alice", "b": None}
+
+
+def test_get_multiple_fields_reraises_when_all_fallbacks_fail(
+    client: OnePasswordClient, fake_run: FakeRun
+) -> None:
+    # Batch fails AND every per-field read fails too — the signature of a real
+    # error (missing item / expired session), not a single bad field name. The
+    # original error must surface rather than being masked as all-None.
+    fake_run.set_response(returncode=1, stderr="item not found")  # batch
+    fake_run.set_response(returncode=1, stderr="item not found")  # get_field("a")
+    fake_run.set_response(returncode=1, stderr="item not found")  # get_field("b")
+    with pytest.raises(OnePasswordError, match="item not found"):
+        client.get_multiple_fields("Missing", ["a", "b"])
 
 
 def test_get_multiple_fields_empty_skips_call(
