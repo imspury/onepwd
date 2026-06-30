@@ -52,6 +52,7 @@ packages = ["src/onepwd"]
 include = [
     "src/onepwd",
     "tests",
+    "examples",
     "README.md",
     "LICENSE",
     "pyproject.toml",
