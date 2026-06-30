@@ -144,11 +144,16 @@ class OnePasswordClient:
         field_name: str,
         vault: str | None = None,
     ) -> str:
-        """Return a single field value as a string (whitespace-stripped).
+        """Return a single field value as a string.
 
         Concealed fields (passwords, tokens) are revealed — without ``--reveal``
         ``op`` returns ``[concealed]``, which is never what a programmatic
         caller wants.
+
+        Only the trailing newline ``op`` appends is removed; whitespace that is
+        part of the secret itself is preserved. (A blanket ``.strip()`` would
+        silently corrupt credentials that legitimately begin or end with
+        spaces.)
         """
         args = [
             "item",
@@ -159,7 +164,8 @@ class OnePasswordClient:
         ]
         if vault:
             args.append(f"--vault={vault}")
-        return _run_op(args, parse_json=False).strip()
+        raw = _run_op(args, parse_json=False)
+        return raw.removesuffix("\n").removesuffix("\r")
 
     def get_multiple_fields(
         self,
@@ -170,10 +176,15 @@ class OnePasswordClient:
         """Return a dict of field name → value.
 
         Issues a single ``op item get`` call and maps the returned field array
-        back to the requested names. If ``op`` rejects the batch because *any*
-        of the names is unknown, falls back to per-field reads so the caller
-        still gets values for the names that do exist (missing ones come back
-        as ``None``).
+        back to the requested names. If ``op`` rejects the batch (typically
+        because one of the names is unknown), falls back to per-field reads so
+        the caller still gets values for the names that *do* exist; names that
+        genuinely don't exist come back as ``None``.
+
+        If the batch fails *and* every per-field read also fails — the signature
+        of a real error such as a missing item or expired session rather than a
+        single bad field name — the original batch error is re-raised instead of
+        masking it as an all-``None`` result.
         """
         if not field_names:
             return {}
@@ -197,7 +208,10 @@ class OnePasswordClient:
                 item_name,
                 e,
             )
-            return self._get_fields_individually(item_name, field_names, vault)
+            result = self._get_fields_individually(item_name, field_names, vault)
+            if all(v is None for v in result.values()):
+                raise
+            return result
 
         # Single-field requests come back as a dict; multi-field as a list.
         entries = [payload] if isinstance(payload, dict) else list(payload)
